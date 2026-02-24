@@ -4,6 +4,11 @@ import equinox as eqx
 import equinox.nn as nn
 from jaxtyping import Array, Float, Int, PRNGKeyArray, PyTree
 
+from utils import Drop_Path, torch_to_equinox
+from typing import Callable
+
+from timm import create_model
+import re
 
 class Adapter(eqx.Module):
     down_proj: nn.Linear
@@ -170,6 +175,7 @@ class Block(eqx.Module):
     fc1: nn.Linear
     fc2: nn.Linear
     mlp_drop: nn.Dropout
+    drop_path: Drop_Path
 
     def __init__(
             self,
@@ -184,7 +190,7 @@ class Block(eqx.Module):
     ):
         subkey1, subkey2, subkey3 = jax.random.split(key,3)
 
-        self.drop_path = drop_path
+        self.drop_path = Drop_Path(drop_path)
 
         self.norm1 = nn.LayerNorm(dim)
 
@@ -192,36 +198,11 @@ class Block(eqx.Module):
 
         self.norm2 = nn.LayerNorm(dim)
 
-        mlp_hidden = dim * mlp_ratio
+        mlp_hidden = int(dim * mlp_ratio)
 
         self.fc1 = nn.Linear(dim, mlp_hidden, key=subkey2)
         self.fc2 = nn.Linear(mlp_hidden, dim, key=subkey3)
         self.mlp_drop = nn.Dropout(drop)
-
-    def _drop_path(
-            self,
-            x: Array,
-            key: PRNGKeyArray,
-            inference: bool = False
-    ):
-        
-        def _drop(x, key):
-            key_prob = 1 - self.drop_path
-            B = x.shape[0]
-            shape = (B,) + (1,) * (x.ndim - 1)
-
-            mask = jax.random.bernoulli(key, key_prob, shape)
-
-            output = (x * mask) / key_prob
-            
-            return output
-        
-        return jax.lax.cond(
-            self.drop_path > 0. or not inference,
-            _drop,
-            lambda x, k: x,
-            x, key
-        )
 
     def __call__(
             self,
@@ -232,7 +213,7 @@ class Block(eqx.Module):
             gates: list[Array]| None = None
     ):
         subkey1, subkey2, subkey3, subkey4, subkey5, key = jax.random.split(key, 6)
-        x = x + self._drop_path(self.attn(self.norm1(x, state), subkey1), subkey2)
+        x = x + self.drop_path(self.attn(self.norm1(x, state), subkey1), subkey2)
         residual = x
 
         x = self.norm2(x, state)
@@ -242,29 +223,80 @@ class Block(eqx.Module):
 
         x = self.fc2(x)
         x = self.mlp_drop(x, subkey4)
-        x = self._drop_path(x, subkey5)
+        x = self.drop_path(x, subkey5)
 
         def adapter_loop(x,key):
             adapt_outputs = []
-            for i, adapt in enumerate(adapters):
-                subkey, key = jax.random.split(key)
-                adapt_out = adapt(x, state, subkey, add_residual=False)
-                adapt_outputs.append(adapt_out * gates[i])
-            adapt_x = jnp.sum(adapt_outputs)
+            def _gated(x, key):
+                for i, adapt in enumerate(adapters):
+                    subkey, key = jax.random.split(key)
+                    adapt_out = adapt(x, state, subkey, add_residual=False)
+                    adapt_outputs.append(adapt_out * gates[i])
+                return jnp.sum(adapt_outputs)
+            adapt_x = jax.lax.cond(
+                gates != [],
+                _gated,
+                lambda x, k: adapters[0](x, state, k, add_residual=False),
+                x, key
+            )
             x = x + adapt_x
             return x + residual
         
         x = jax.lax.cond(
-            adapters is not None and gates is not None,
+            adapters is not None,
             adapter_loop,
             lambda x, k: x + residual,
             x, key
         )
         return key
 
+class PatchEmbed(eqx.Module):
+    proj: nn.Conv2d
+    norm: nn.LayerNorm | nn.Identity
+    patch_size: Int
+    img_size: Int
+    num_patches: Int
+    embed_dim: Int
+
+    def __init__(
+            self,
+            img_size: Int = 224,
+            patch_size: Int = 16,
+            in_channels: Int = 3,
+            embed_dim: Int = 768,
+            norm_layer: bool = False,
+            *,
+            key: PRNGKeyArray
+        ):
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.num_patches = (img_size // patch_size)**2
+        self.embed_dim = embed_dim
+
+        self.proj = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=embed_dim,
+            kernel_size=patch_size,
+            stride=patch_size,
+            key=key
+        )
+
+        self.norm = nn.LayerNorm(embed_dim) if norm_layer else nn.Identity()
+
+    def __call__(
+            self,
+            x: Array
+    ):
+        x = self.proj(x)
+        x = x.reshape(self.embed_dim, -1).T
+
+        x = jax.vmap(self.norm)(x)
+        return x
+
 class VisionTransformer(eqx.Module):
     num_classes: Int = eqx.field(static=True)
-    patch_embed: nn.Conv2d
+    embed_dim: Int = eqx.field(static=True)
+    patch_embed: PatchEmbed
     cls_token: jax.Array
     dist_token: jax.Array
     pos_embed: jax.Array
@@ -272,18 +304,17 @@ class VisionTransformer(eqx.Module):
     blocks: list[Block]
     norm: nn.LayerNorm
     head: nn.Linear
-    head_dist: nn.Linear
-    embeddings: list[jax.Array]
+    # head_dist: nn.Linear
+    # embeddings: list[jax.Array]
     adapter_list: list
-    gate_list: list
+    adapter_gates: list
 
     def __init__(
             self,
-            img_size: Int,
-            patch_size: Int,
-            in_chan: Int,
-            num_classes: Int,
-            key: PRNGKeyArray,
+            img_size: Int = 224,
+            patch_size: Int = 16,
+            in_chan: Int = 3,
+            num_classes: Int = 1000,
             embed_dim: Int = 1024,
             depth: Int = 12,
             num_heads: Int = 12,
@@ -293,21 +324,22 @@ class VisionTransformer(eqx.Module):
             attn_drop_rate: Float = 0.,
             drop_path_rate: Float = 0.,
             tunning_config: dict | None = None,
+            *,
+            key: PRNGKeyArray,
     ):
-        subkey1, subkey2 = jax.random.split(key, 2)
+        subkey1, subkey2, subkey3, subkey4 = jax.random.split(key, 4)
         self.num_classes = num_classes
-        self.num_features = embed_dim
+        self.embed_dim = embed_dim
 
-        self.patch_embed = nn.Conv2d(in_chan, embed_dim, kernel_size=patch_size, stride=patch_size, key=subkey1)
-        num_patches = (img_size // patch_size) ** 2
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_chan, embed_dim, key=subkey1)
 
         self.cls_token = jnp.zeros((1,1, embed_dim), dtype=jnp.float32)
         self.dist_token = jnp.zeros((1,1, embed_dim), dtype=jnp.float32)
-        self.pos_embed = jnp.zeros((1, num_patches + 2, embed_dim), dtype=jnp.float32)
+        self.pos_embed = jnp.zeros((1, self.patch_embed.num_patches + 2, embed_dim), dtype=jnp.float32)
         self.pos_drop = nn.Dropout(drop_rate)
 
         dpr = [x.item() for x in jnp.linspace(0, drop_path_rate, depth)]
-        key, *subkeys = jax.random.split(2, depth+1)
+        key, *subkeys = jax.random.split(subkey2, depth+1)
 
         self.blocks = [
             Block(
@@ -318,12 +350,149 @@ class VisionTransformer(eqx.Module):
 
         self.norm = nn.LayerNorm(embed_dim)
 
-        self.head = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+        self.head = nn.Linear(embed_dim, num_classes, key=subkey3) if num_classes > 0 else nn.Identity()
 
-        self.head_dist = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+        # self.head_dist = nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-        self.embeddings = [
-            jnp.ones((1, tunning_config["vpt_num"], embed_dim), dtype=jnp.float32) for _ in range(depth)
-        ]
+        # self.embeddings = [
+        #     jnp.ones((1, tunning_config["vpt_num"], embed_dim), dtype=jnp.float32) for _ in range(depth)
+        # ]
         self.adapter_list = []
-        self.gate_list = []
+        self.adapter_gates = []
+        self.get_new_adapter(subkey4)
+    
+    def set_adapter_gates(
+            self,
+            fisher_traces: Array,
+            temp: Float = 3.
+    ):
+        fisher = jnp.array(fisher_traces, dtype=jnp.float32)
+        self.adapter_gates = jax.nn.softmax(fisher / temp, axis=0)
+
+    def compute_forgetting_score_adapters(
+            self,
+            forgetting_traces,
+            inputs: Array,
+            targets: Array,
+            loss_fn: Callable,
+            lr: Float = 1e-3
+    ):
+        targets = jnp.array(targets, dtype=jnp.int16)
+        theta_list = []
+        for adapter in self.adapter_list:
+            theta_list.append(jax.tree_util.tree_leaves(eqx.filter(adapter, eqx.is_inexact_array)))
+        
+        grads = eqx.filter_grad(loss_fn)(self(inputs), targets)
+
+        theta_t_list = []
+        for idx, adapter in enumerate(self.adapter_list):
+            params, _ = eqx.partition(adapter, eqx.is_array)
+            adapter_grad = grads.adapter_list[idx]
+            up_params = jax.tree.map(
+                lambda p, g: p - lr * g,
+                params,
+                adapter_grad
+            )
+            theta_t_list.append(jax.tree_util.tree_leaves(eqx.filter(up_params, eqx.is_inexact_array)))
+        
+        scores = []
+        for F, theta, theta_t in zip(forgetting_traces, theta_list, theta_t_list):
+            score = 0.
+            for f, p, p_t in zip(F, theta, theta_t):
+                score += jnp.sum(f * (p - p_t)**2).item()
+            scores.append(score)
+        return self.zscore_normalize(scores)
+    
+    def zscore_normalize(self, scores: list):
+        scores = jnp.array(scores)
+        mean = jnp.mean(scores)
+        std = jnp.mean(scores)
+
+        return jax.lax.cond(
+            std > 0,
+            lambda s, m, st: ((s - m) / st).tolist(),
+            lambda s, m, st: [0.0 for _ in s],
+            scores, mean, std
+        )
+    
+    def sum_fisher_traces(self, traces):
+        sum_traces = []
+        for adapter_traces in traces:
+            total = 0.
+            for param_trace in adapter_traces:
+                total += jnp.sum(param_trace).item()
+            sum_traces.append(total)
+        return sum_traces
+    
+    def compute_fisher_trace(
+            self,
+            dataloader: Callable,
+            loss_fn: Callable,
+            num_batches: Int = 10
+    ):
+        traces = jax.tree.map(
+            lambda p: jnp.zeros_like(p),
+            self.adapter_list    
+        )
+
+        for _ in range(num_batches):
+            inputs, _, targets = dataloader.__iter__()
+            grads = eqx.filter_grad(loss_fn)(self(inputs), targets)
+
+            grads = eqx.tree_at(lambda g: g.adapter_list, grads)
+            traces = jax.tree.map(
+                lambda t, g: t + g**2,
+                traces,
+                grads
+            )
+        
+        traces = jax.tree.map(
+            lambda t: t / num_batches,
+            traces
+        )
+
+        self.set_adapter_gates(traces) # needs to be like trace[0].sum().item() but I need to see it first
+        return traces
+    
+    def get_new_adapter(self, key):
+        for i in range(len(self.blocks)):
+            subkey, key = jax.random.split(key)
+            adapter = Adapter(self.embed_dim, self.embed_dim // 2, key=subkey)
+            self.adapter_list.append(adapter)
+    
+    def __call__(
+            self,
+            x: Array,
+            state,
+            key: PRNGKeyArray | None = None
+    ):
+        
+        subkey, key = jax.random.split(key)
+        B = x.shape[0]
+        x = self.patch_embed(x)
+
+        x = jnp.concat((self.cls_token, x), axis=1)
+        x = x + self.pos_embed
+        x = self.pos_drop(x, subkey)
+
+        for idx, blk in enumerate(self.blocks):
+            subkey, key = jax.random.split(key)
+            # x = jnp.concat(self.embeddings[idx], x, dim=1)
+
+            x = blk(x, state, key, self.adapter_list, self.adapter_gates)
+        x = self.norm(x, state)
+        outcome = x[:,0]
+
+        return outcome
+    
+if __name__ == "__main__":
+    seed = 42
+    key = jax.random.PRNGKey(seed)
+    subkey1, subkey2 = jax.random.split(key)
+    model = VisionTransformer(patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4., qkv_bias=True, key = subkey1)
+
+    checkpoint_model = create_model("vit_base_patch16_224", pretrained=True, num_classes=0)
+    state_dict = checkpoint_model.state_dict()
+    
+    new_model = torch_to_equinox(model, state_dict, 768)
+    print("hi")
